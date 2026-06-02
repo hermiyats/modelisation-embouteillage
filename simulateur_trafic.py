@@ -32,12 +32,22 @@ Schéma numérique (Euler explicite)
 avec un garde-fou anticollision sur la vitesse pour empêcher tout
 chevauchement dû à la discrétisation.
 
+Changement de voie progressif
+------------------------------
+La décision de voie reste discrète (un entier `voie`), mais chaque voiture
+porte aussi une position latérale CONTINUE `pos_laterale` qui rejoint la voie
+cible à vitesse constante (paramètre `tps_changement_voie`). Toute la logique
+(voisins, anticollision) travaille sur l'entier `voie` ; `pos_laterale` ne sert
+qu'au rendu, pour que les changements de voie soient fluides et non instantanés.
+
 Tout est purement algorithmique : aucun affichage ici. Les visualisations se
-font dans le notebook à partir des historiques `X`, `V`, `A`, `VOIE`.
+font à partir des historiques `X`, `V`, `A`, `VOIE` et `YLAT` (latéral continu).
 """
 
 from __future__ import annotations
 
+import math
+from collections import deque
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -88,6 +98,12 @@ class Parametres:
     longueur_voiture: float = 3.0   # longueur d'une voiture (m)
     distance_min: float = 1.0       # interstice minimal pare-chocs en bouchon (m)
 
+    # --- Comportement ---
+    temps_reaction: float = 0.8     # temps de réaction du conducteur (s) : il agit
+                                    # sur l'état du trafic perçu il y a `temps_reaction`
+                                    # secondes (0 = réaction instantanée). Rend les
+                                    # rabattements serrés dangereux (freinage tardif).
+
     # --- Valeurs de base (profil « normal ») dont dérivent les autres profils ---
     mu: float = 0.4
     distance_securite: float = 10.0
@@ -100,6 +116,11 @@ class Parametres:
     nb_arret_initial: int = 3        # voitures à l'arrêt au départ (onde de bouchon)
     graine: int | None = None        # graine aléatoire (None = non reproductible)
 
+    # --- Rendu / animation ---
+    tps_changement_voie: float = 0.8  # durée d'un changement de voie (s) ; n'agit
+                                      # que sur la position latérale de rendu, pas
+                                      # sur la décision (qui reste instantanée)
+
     @property
     def nb_iterations(self) -> int:
         """Nombre de pas de temps de la simulation."""
@@ -109,6 +130,11 @@ class Parametres:
     def distance_centre_min(self) -> float:
         """Distance centre à centre minimale (anticollision)."""
         return self.longueur_voiture + self.distance_min
+
+    @property
+    def n_pas_reaction(self) -> int:
+        """Temps de réaction exprimé en nombre de pas de temps (>= 0)."""
+        return max(0, round(self.temps_reaction / self.dt))
 
 
 def construire_profils(p: Parametres) -> dict[str, ProfilConducteur]:
@@ -166,6 +192,9 @@ class Voiture:
         self.v = float(v)        # vitesse (m/s)
         self.a = 0.0             # accélération courante (m/s^2)
         self.voie = int(voie)    # 1 = voie de droite, ..., N_voie = voie de gauche
+        # Position latérale CONTINUE (en « numéro de voie » fractionnaire) qui
+        # rejoint progressivement `voie`. Sert uniquement au rendu fluide.
+        self.pos_laterale = float(voie)
         self.profil = profil
 
     # Raccourcis pratiques vers les paramètres du profil
@@ -216,8 +245,14 @@ class Simulation:
         self.profils_voitures = [v.profil.nom for v in self.voitures]
         self.couleurs = [v.profil.couleur for v in self.voitures]
 
+        # Mémoire de perception pour le temps de réaction : on garde les
+        # `n_pas_reaction` derniers états (positions, vitesses, voies). Le
+        # conducteur décide son accélération d'après l'état le plus ancien
+        # encore en mémoire (donc perçu il y a `temps_reaction` secondes).
+        self._perception: deque = deque(maxlen=self.p.n_pas_reaction + 1)
+
         # Historiques (remplis par simuler())
-        self.X = self.V = self.A = self.VOIE = self.temps = None
+        self.X = self.V = self.A = self.VOIE = self.YLAT = self.temps = None
 
     # ------------------------------------------------------------------
     #  Initialisation
@@ -251,35 +286,32 @@ class Simulation:
         """Voiture la plus proche DEVANT i sur `voie_visee`.
 
         Retourne (indice ou None, distance centre à centre). Si aucune voiture
-        n'est trouvée, retourne (None, L) — route libre.
+        n'est trouvée, retourne (None, L) — route libre. Version vectorisée
+        (numpy) : équivalente à une boucle `0 < d < meilleure` mais plus rapide.
         """
         L = self.p.L
-        meilleure = L
-        indice = None
-        xi = positions[i]
-        for j in range(self.p.N):
-            if j == i or voies[j] != voie_visee:
-                continue
-            d = (positions[j] - xi) % L          # distance vers l'avant (cyclique)
-            if 0 < d < meilleure:
-                meilleure = d
-                indice = j
-        return indice, meilleure
+        pos = np.asarray(positions, dtype=float)
+        voi = np.asarray(voies)
+        d = (pos - pos[i]) % L                    # distance vers l'avant (cyclique)
+        cand = (voi == voie_visee) & (d > 0)      # même voie, devant (exclut i : d[i]=0)
+        if not cand.any():
+            return None, L
+        d_cand = np.where(cand, d, np.inf)
+        k = int(np.argmin(d_cand))                # plus proche ; ex æquo -> plus petit indice
+        return k, float(d_cand[k])
 
     def voiture_derriere(self, i, voie_visee, positions, voies):
-        """Voiture la plus proche DERRIÈRE i sur `voie_visee`."""
+        """Voiture la plus proche DERRIÈRE i sur `voie_visee` (vectorisée)."""
         L = self.p.L
-        meilleure = L
-        indice = None
-        xi = positions[i]
-        for j in range(self.p.N):
-            if j == i or voies[j] != voie_visee:
-                continue
-            d = (xi - positions[j]) % L          # distance vers l'arrière (cyclique)
-            if 0 < d < meilleure:
-                meilleure = d
-                indice = j
-        return indice, meilleure
+        pos = np.asarray(positions, dtype=float)
+        voi = np.asarray(voies)
+        d = (pos[i] - pos) % L                    # distance vers l'arrière (cyclique)
+        cand = (voi == voie_visee) & (d > 0)
+        if not cand.any():
+            return None, L
+        d_cand = np.where(cand, d, np.inf)
+        k = int(np.argmin(d_cand))
+        return k, float(d_cand[k])
 
     # ------------------------------------------------------------------
     #  Décision de changement de voie (règles européennes)
@@ -345,28 +377,60 @@ class Simulation:
         # --- 1) Changements de voie (décidés sur l'état au temps t) ---
         # Mise à jour incrémentale : une voiture déjà déplacée est vue par les
         # suivantes, ce qui limite les conflits de déboîtement simultané.
-        voies_t1 = list(voies)
+        voies_t1 = np.array(voies, dtype=int)
         for i in range(N):
             voies_t1[i] = self._decider_voie(i, positions, voies_t1)
         for i in range(N):
-            self.voitures[i].voie = voies_t1[i]
+            self.voitures[i].voie = int(voies_t1[i])
 
-        # --- 2) Accélération puis vitesse provisoire ---
+        # --- 1bis) Glissement latéral continu vers la voie cible ---
+        # La voie (entier) est déjà fixée ci-dessus et pilote toute la logique.
+        # `pos_laterale` la rejoint à vitesse constante : un changement d'une
+        # voie prend `tps_changement_voie` secondes, ce qui rend la manœuvre
+        # progressive à l'écran au lieu d'un saut instantané.
+        if p.tps_changement_voie > 0:
+            pas_lateral = p.dt / p.tps_changement_voie      # voies par pas de temps
+            for voit in self.voitures:
+                ecart = float(voit.voie) - voit.pos_laterale
+                if abs(ecart) <= pas_lateral:
+                    voit.pos_laterale = float(voit.voie)
+                else:
+                    voit.pos_laterale += math.copysign(pas_lateral, ecart)
+        else:
+            for voit in self.voitures:                      # changement instantané
+                voit.pos_laterale = float(voit.voie)
+
+        # --- 1ter) Mémoriser l'état courant pour la perception retardée ---
+        # On enregistre l'état (positions, vitesses, voies) APRÈS les changements
+        # de voie : c'est ce que les autres conducteurs « verront », mais avec un
+        # retard `temps_reaction`. Le plus ancien élément du tampon date donc de
+        # `temps_reaction` secondes (ou moins pendant l'amorçage initial).
+        self._perception.append((positions, vitesses, voies_t1))
+        pos_perc, vit_perc, voies_perc = self._perception[0]
+
+        # --- 2) Accélération (sur l'état PERÇU) puis vitesse provisoire ---
+        # Le conducteur réagit à ce qu'il a perçu il y a `temps_reaction` s : si
+        # un « fou » vient de se rabattre devant lui, il ne le « voit » pas encore
+        # et freine donc en retard, ce qui rend les rabattements serrés dangereux.
         vitesses_prov = np.zeros(N)
         leaders = [None] * N
         d_centre_leaders = [p.L] * N
         for i in range(N):
             voit = self.voitures[i]
-            j, d_centre = self.voiture_devant(i, voit.voie, positions, voies_t1)
-            leaders[i] = j
-            d_centre_leaders[i] = d_centre
-            ecart = d_centre - p.longueur_voiture
-            v_devant = vitesses[j] if j is not None else voit.v
+            # Leader PERÇU (état retardé) -> accélération souhaitée
+            jp, d_centre_p = self.voiture_devant(i, voies_perc[i], pos_perc, voies_perc)
+            ecart = d_centre_p - p.longueur_voiture
+            v_devant = vit_perc[jp] if jp is not None else voit.v
             voit.a = voit.acceleration_souhaitee(ecart, v_devant, p.dt, p.a_min, p.a_max)
             v_new = voit.v + voit.a * p.dt
             vitesses_prov[i] = min(max(v_new, p.v_min), voit.vitesse_max)
+            # Leader RÉEL (état courant) -> mémorisé pour le garde-fou anticollision
+            jc, d_centre_c = self.voiture_devant(i, voies_t1[i], positions, voies_t1)
+            leaders[i] = jc
+            d_centre_leaders[i] = d_centre_c
 
-        # --- 3) Garde-fou anticollision ---
+        # --- 3) Garde-fou anticollision (sur l'état RÉEL : empêche tout
+        #        chevauchement même quand le conducteur a freiné trop tard) ---
         for i in range(N):
             j = leaders[i]
             if j is not None:
@@ -393,7 +457,8 @@ class Simulation:
             X[n, i]    position de la voiture i au pas n
             V[n, i]    vitesse
             A[n, i]    accélération appliquée pendant le pas n -> n+1
-            VOIE[n, i] voie (entier)
+            VOIE[n, i] voie cible (entier)
+            YLAT[n, i] position latérale continue (float, pour le rendu fluide)
         """
         p = self.p
         nb = p.nb_iterations
@@ -401,19 +466,21 @@ class Simulation:
         V = np.empty((nb, p.N))
         A = np.empty((nb, p.N))
         VOIE = np.empty((nb, p.N), dtype=int)
+        YLAT = np.empty((nb, p.N))
 
         for n in range(nb):
             for i, voit in enumerate(self.voitures):
                 X[n, i] = voit.x
                 V[n, i] = voit.v
                 VOIE[n, i] = voit.voie
+                YLAT[n, i] = voit.pos_laterale
             self.etape()
             for i, voit in enumerate(self.voitures):
                 A[n, i] = voit.a
             if verbeux and nb >= 10 and n % (nb // 10) == 0:
                 print(f"  pas {n:>6}/{nb}  (t = {n * p.dt:6.1f} s)")
 
-        self.X, self.V, self.A, self.VOIE = X, V, A, VOIE
+        self.X, self.V, self.A, self.VOIE, self.YLAT = X, V, A, VOIE, YLAT
         self.temps = np.arange(nb) * p.dt
         return self
 
