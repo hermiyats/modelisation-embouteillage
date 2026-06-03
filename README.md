@@ -61,26 +61,51 @@ Commandes de la fenêtre pygame :
 | `R` | revenir au début |
 | `Échap` / `Q` | quitter |
 
-## Modèle
+## Modèle (poursuite type Helly)
 
-Pour la voiture `i` suivant la voiture `j` (écart pare-chocs `d`, pas de temps `dt`) :
+Pour la voiture `i` suivant la voiture `j` (écart pare-chocs `d`, vitesse `v_i`) :
 
 ```
-ecart_prevu = d + (v_j - v_i) * dt
-a_i = mu_i * (ecart_prevu - d_sec_i)        # bridée dans [a_min, a_max]
+d_desiree = d_arret_i + T_i * v_i                     # écart visé CROISSANT avec v
+a_i = mu_i * (d - d_desiree) + lambda * (v_j - v_i)   # bridée dans [a_min, a_max]
 ```
 
-Intégration par schéma d'**Euler explicite**, avec un garde-fou anticollision :
+Deux termes :
+- `mu * (d - d_desiree)` — on vise le bon écart, qui **croît avec la vitesse**
+  (« règle des t secondes ») au lieu d'être constant ;
+- `lambda * (v_j - v_i)` — on réagit à la **vitesse d'approche** : on freine dès
+  qu'on se rapproche vite d'un véhicule plus lent, *même si l'écart est encore
+  grand*. (C'est ce qui manquait à un modèle purement basé sur la distance.)
+
+Intégration par schéma d'**Euler semi-implicite** :
 
 ```
 v_i <- clip(v_i + a_i * dt, 0, v_max_i)
 x_i <- (x_i + v_i * dt) mod L
 ```
 
-Les trois coefficients réglables par conducteur :
-- `mu` — sensibilité de l'accélération (force de la réaction à l'écart) ;
-- `d_sec` — distance de sécurité visée ;
-- `v_max` — vitesse maximale.
+**Freinage borné physiquement et collisions.** Le conducteur freine au plus à
+`a_min` (confort). Un garde-fou peut aller jusqu'à `a_urgence` (limite physique
+des pneus, calculé par la vitesse sûre cinématique `v_j + √(2·|a_urgence|·espace)`).
+Si **même** `a_urgence` ne suffit pas (réaction trop tardive, créneau coupé),
+c'est une **collision** : elle est comptée (`sim.nb_collisions`) tout en évitant
+le chevauchement, pour que la simulation reste continue.
+
+Coefficients réglables par conducteur :
+- `mu` — sensibilité à l'écart ;
+- `distance_securite` (`d_arret`) — écart résiduel **à l'arrêt** (bouchon) ;
+- `temps_inter` (`T`) — temps inter-véhiculaire (la marge qui croît avec la vitesse) ;
+- `vitesse_max`.
+
+## Changements de voie (MOBIL)
+
+Un créneau n'est accepté que si l'insertion ne force personne (ni soi, ni la
+voiture arrière) à freiner plus fort qu'un seuil, calculé à partir des
+**vitesses** *et* du **temps de réaction** — pas d'une simple distance. On ne
+coupe donc pas la route à une voiture rapide qui arrive. Le `fou` tolère des
+freinages d'**urgence** (il colle, il coupe), le conducteur normal reste sur du
+confort (`freinage_securite`). Un délai minimal `tps_min_changement_voie` entre
+deux manœuvres empêche le papillonnage.
 
 ## Temps de réaction
 
@@ -110,10 +135,10 @@ python3 animation_pygame.py --treaction 0     # réaction instantanée
 
 | Profil | Particularité |
 |---|---|
-| `prudent` | grande distance de sécurité, vitesse plus faible |
+| `prudent` | grand temps inter-véhiculaire, vitesse plus faible |
 | `normal` | valeurs de référence |
-| `fou` | rapide, agressif ; **ignore la voiture arrière** quand il déboîte pour doubler |
-| `camion` | lent ; **interdit de 3e voie** |
+| `fou` | rapide, colle au pare-chocs (petit `T`) ; en déboîtant il **tolère d'imposer un freinage d'urgence** à l'arrière (il coupe la route) |
+| `camion` | lent, grande marge ; **interdit de 3e voie** |
 
 ## Règles de circulation (européennes)
 

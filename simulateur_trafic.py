@@ -6,23 +6,28 @@ Route CIRCULAIRE à une ou plusieurs voies. Chaque voiture est un agent
 (classe `Voiture`) ; la classe `Simulation` contient le code principal qui
 résout le schéma numérique pas à pas et enregistre tout l'historique.
 
-Modèle d'accélération
----------------------
+Modèle d'accélération (poursuite type Helly)
+--------------------------------------------
 Pour la voiture i, on note :
-    - d        : écart pare-chocs à pare-chocs avec la voiture de devant
-    - v_devant : vitesse de la voiture de devant
-    - dt       : pas de temps
-    - d_sec    : distance de sécurité (paramètre du profil)
-    - mu       : coefficient de sensibilité de l'accélération (profil)
+    - d         : écart pare-chocs à pare-chocs avec la voiture de devant
+    - v_devant  : vitesse de la voiture de devant
+    - v         : sa propre vitesse
+    - d_arret   : écart résiduel à l'arrêt (`distance_securite` du profil)
+    - T         : temps inter-véhiculaire (`temps_inter` du profil)
+    - mu        : sensibilité à l'écart (profil)
+    - lambda    : sensibilité à la vitesse d'approche (`sensibilite_vitesse`)
 
-On calcule un écart PRÉVU au pas suivant puis l'accélération :
+L'écart DÉSIRÉ croît avec la vitesse (règle des t secondes) :
 
-    ecart_prevu = d + (v_devant - v) * dt
-    a = mu * (ecart_prevu - d_sec)              (puis bridée dans [a_min, a_max])
+    d_desiree(v) = d_arret + T * v
 
-mu contrôle donc la force avec laquelle la voiture accélère (si elle a de la
-marge) ou freine (si elle se rapproche trop) par rapport à sa distance de
-sécurité.
+et l'accélération combine deux termes :
+
+    a = mu * (d - d_desiree(v)) + lambda * (v_devant - v)   (bridée [a_min, a_max])
+
+Le 1er terme vise le bon écart (croissant avec la vitesse) ; le 2e fait freiner
+dès qu'on se RAPPROCHE vite d'un véhicule plus lent, même si l'écart est encore
+grand — ce qui manquait à un modèle purement basé sur la distance.
 
 Schéma numérique (Euler explicite)
 ----------------------------------
@@ -70,8 +75,10 @@ class ProfilConducteur:
 
     nom: str
     mu: float                       # sensibilité de l'accélération
-    distance_securite: float        # distance de sécurité visée (m, pare-chocs)
+    distance_securite: float        # écart pare-chocs visé À L'ARRÊT (m, en bouchon)
     vitesse_max: float              # vitesse maximale (m/s)
+    temps_inter: float = 1.4        # temps inter-véhiculaire (s) : marge ajoutée à
+                                    #   l'écart visé, proportionnelle à la vitesse
     couleur: str = "tab:green"      # couleur pour l'animation
     voie_max: int | None = None     # voie la plus à gauche autorisée
     ignore_arriere_au_depassement: bool = False
@@ -93,7 +100,8 @@ class Parametres:
 
     # --- Physique ---
     a_max: float = 3.0         # accélération maximale (m/s^2)
-    a_min: float = -7.0        # décélération maximale / freinage (m/s^2)
+    a_min: float = -7.0        # freinage de CONFORT maximal du conducteur (m/s^2)
+    a_urgence: float = -9.0    # freinage d'URGENCE maximal (limite physique pneus)
     v_min: float = 0.0         # vitesse minimale (m/s)
     longueur_voiture: float = 3.0   # longueur d'une voiture (m)
     distance_min: float = 1.0       # interstice minimal pare-chocs en bouchon (m)
@@ -103,10 +111,17 @@ class Parametres:
                                     # sur l'état du trafic perçu il y a `temps_reaction`
                                     # secondes (0 = réaction instantanée). Rend les
                                     # rabattements serrés dangereux (freinage tardif).
+    freinage_securite: float = 4.0  # décélération max (m/s^2) qu'on accepte d'imposer
+                                    # à la voiture arrière en déboîtant (critère MOBIL)
+    tps_min_changement_voie: float = 2.0  # temps minimal entre deux changements de
+                                          # voie d'une même voiture (anti-papillonnage)
 
     # --- Valeurs de base (profil « normal ») dont dérivent les autres profils ---
-    mu: float = 0.4
-    distance_securite: float = 10.0
+    mu: float = 0.4                       # sensibilité à l'écart
+    distance_securite: float = 2.0        # écart pare-chocs À L'ARRÊT / en bouchon (m)
+    temps_inter_vehiculaire: float = 1.4  # « règle des t secondes » : écart visé =
+                                          #   distance_securite + t * vitesse  (s)
+    sensibilite_vitesse: float = 0.6      # lambda : réaction à la vitesse d'approche
     vitesse_max: float = 30.0
 
     # --- Population ---
@@ -145,11 +160,13 @@ def construire_profils(p: Parametres) -> dict[str, ProfilConducteur]:
     se décalent de façon cohérente. On crée aussi un écart de vitesse net entre
     les comportements (prudent < normal < fou, camion le plus lent).
     """
+    base_t = p.temps_inter_vehiculaire
     return {
         "prudent": ProfilConducteur(
             nom="prudent",
             mu=p.mu - 0.15,
-            distance_securite=p.distance_securite + 5.0,
+            distance_securite=p.distance_securite + 1.5,
+            temps_inter=base_t + 0.5,              # garde une grande marge temporelle
             vitesse_max=p.vitesse_max - 5.0,
             couleur="tab:blue",
         ),
@@ -157,13 +174,15 @@ def construire_profils(p: Parametres) -> dict[str, ProfilConducteur]:
             nom="normal",
             mu=p.mu,
             distance_securite=p.distance_securite,
+            temps_inter=base_t,
             vitesse_max=p.vitesse_max,
             couleur="tab:green",
         ),
         "fou": ProfilConducteur(
             nom="fou",
             mu=p.mu + 0.30,
-            distance_securite=max(2.0, p.distance_securite - 3.0),
+            distance_securite=max(0.5, p.distance_securite - 1.0),
+            temps_inter=max(0.4, base_t - 0.7),    # colle au pare-chocs (tailgating)
             vitesse_max=p.vitesse_max + 4.0,
             couleur="tab:red",
             ignore_arriere_au_depassement=True,   # ignore la voiture arrière
@@ -171,7 +190,8 @@ def construire_profils(p: Parametres) -> dict[str, ProfilConducteur]:
         "camion": ProfilConducteur(
             nom="camion",
             mu=max(0.05, p.mu - 0.20),
-            distance_securite=p.distance_securite + 10.0,
+            distance_securite=p.distance_securite + 2.0,
+            temps_inter=base_t + 0.4,
             vitesse_max=p.vitesse_max - 10.0,
             couleur="black",
             voie_max=2,                            # interdit de 3e voie
@@ -210,15 +230,38 @@ class Voiture:
     def vitesse_max(self) -> float:
         return self.profil.vitesse_max
 
-    def acceleration_souhaitee(self, ecart: float, v_devant: float,
-                               dt: float, a_min: float, a_max: float) -> float:
-        """Loi du modèle : a = mu * (ecart_prevu - distance_securite).
+    @property
+    def temps_inter(self) -> float:
+        return self.profil.temps_inter
 
-        `ecart` est l'écart pare-chocs actuel avec la voiture de devant ;
-        `v_devant` sa vitesse. Le résultat est bridé dans [a_min, a_max].
+    def distance_desiree(self, v: float | None = None) -> float:
+        """Écart pare-chocs souhaité à la vitesse `v` (défaut : vitesse actuelle).
+
+        Modèle du « temps inter-véhiculaire » (règle des t secondes) :
+
+            d_desiree = distance_securite + temps_inter * v
+
+        L'écart visé CROÎT avec la vitesse (réaliste) au lieu d'être constant ;
+        `distance_securite` est l'écart résiduel à l'arrêt (bouchon).
         """
-        ecart_prevu = ecart + (v_devant - self.v) * dt
-        a = self.mu * (ecart_prevu - self.distance_securite)
+        v = self.v if v is None else v
+        return self.distance_securite + self.temps_inter * max(0.0, v)
+
+    def acceleration_souhaitee(self, ecart: float, v_devant: float,
+                               a_min: float, a_max: float,
+                               sensibilite_vitesse: float) -> float:
+        """Modèle de poursuite type Helly (linéaire, deux termes) :
+
+            a = mu * (ecart - d_desiree(v)) + lambda * (v_devant - v)
+
+        - 1er terme : on vise l'écart désiré, qui croît avec la vitesse ;
+        - 2e terme  : on réagit à la VITESSE D'APPROCHE (lambda = sensibilité).
+          C'est lui qui fait freiner quand on se rapproche vite d'un véhicule
+          plus lent, MÊME si l'écart est encore grand (réaliste).
+        Résultat bridé dans [a_min, a_max].
+        """
+        a = (self.mu * (ecart - self.distance_desiree())
+             + sensibilite_vitesse * (v_devant - self.v))
         return max(a_min, min(a_max, a))
 
     def __repr__(self) -> str:
@@ -251,6 +294,12 @@ class Simulation:
         # encore en mémoire (donc perçu il y a `temps_reaction` secondes).
         self._perception: deque = deque(maxlen=self.p.n_pas_reaction + 1)
 
+        # Comptage des collisions (freinage d'urgence insuffisant). `_en_collision`
+        # évite de recompter chaque pas un même choc (front montant uniquement).
+        self.nb_collisions = 0
+        self._en_collision = [False] * self.p.N
+        self._cooldown_voie = np.zeros(self.p.N, dtype=int)   # anti-papillonnage
+
         # Historiques (remplis par simuler())
         self.X = self.V = self.A = self.VOIE = self.YLAT = self.temps = None
 
@@ -272,7 +321,17 @@ class Simulation:
             profil = self.profils[tirage[i]]
             v0 = 0.0 if i < p.nb_arret_initial else p.vitesse_initiale
             v0 = min(v0, profil.vitesse_max)      # pas plus vite que sa vitesse max
-            self.voitures.append(Voiture(i, positions[i], v0, voie=1, profil=profil))
+            # Voitures réparties sur TOUTES les voies (round-robin), en respectant
+            # la voie max du profil. Cela part d'un état proche de l'équilibre
+            # plutôt que toutes entassées sur une voie. Les voitures arrêtées du
+            # départ restent sur la voie de droite pour créer un bouchon net.
+            if i < p.nb_arret_initial:
+                voie0 = 1
+            else:
+                voie0 = (i % p.N_voie) + 1
+                if profil.voie_max is not None:
+                    voie0 = min(voie0, profil.voie_max)
+            self.voitures.append(Voiture(i, positions[i], v0, voie=voie0, profil=profil))
 
     # ------------------------------------------------------------------
     #  Recherche de voisins sur l'anneau
@@ -316,51 +375,92 @@ class Simulation:
     # ------------------------------------------------------------------
     #  Décision de changement de voie (règles européennes)
     # ------------------------------------------------------------------
-    def _decider_voie(self, i, positions, voies) -> int:
-        """Choisit la voie de la voiture i au pas suivant.
+    def _decel_requise(self, v_arriere, v_avant, ecart, tau) -> float:
+        """Décélération que la voiture arrière devra fournir pour ne pas percuter
+        celle de devant, EN TENANT COMPTE de son temps de réaction `tau`.
 
-        1) On se rabat le plus à droite possible dès qu'il y a la place
-           (devant ET derrière), avec une marge un peu plus large que la
-           distance de sécurité (hystérésis pour éviter les oscillations).
-        2) Sinon, on double UNIQUEMENT par la gauche, et seulement si :
-             - on se rapproche trop de la voiture de devant (écart < d_sec) ;
-             - la voie de gauche est libre devant ;
-             - la voie de gauche est libre derrière (sauf conducteur « fou »).
-           Un camion ne peut jamais aller au-delà de sa voie_max (3e interdite).
+        Pendant `tau` la voiture arrière ne réagit pas : l'écart se referme de
+        `approche * tau`. Sur l'écart restant, il faut résorber la vitesse
+        d'approche : decel = approche^2 / (2 * écart_restant). Si l'écart est
+        déjà consommé avant même de réagir, c'est un choc certain (+inf).
+        """
+        approche = v_arriere - v_avant
+        if approche <= 0.0:
+            return 0.0                                    # ne rattrape pas
+        ecart_restant = ecart - approche * tau
+        if ecart_restant <= 0.1:
+            return float("inf")                           # rattrapé avant de réagir
+        return approche * approche / (2.0 * ecart_restant)
+
+    def _creneau_libre(self, i, voie_cible, positions, voies,
+                       seuil_avant, seuil_arriere) -> bool:
+        """Vrai si la voiture i peut s'insérer sur `voie_cible` sans forcer
+        un freinage trop fort, NI sur elle-même (vs la voiture de devant), NI
+        sur la voiture de derrière (critère de type MOBIL, dépendant des
+        vitesses ET du temps de réaction). Les seuils tolérés diffèrent : un
+        conducteur « fou » accepte des freinages d'urgence (seuil élevé).
+        """
+        p = self.p
+        moi = self.voitures[i]
+        tau = p.temps_reaction
+        lng = p.longueur_voiture
+
+        f, d_centre_f = self.voiture_devant(i, voie_cible, positions, voies)
+        if f is not None:
+            ecart_f = d_centre_f - lng
+            if ecart_f <= p.distance_min:
+                return False
+            if self._decel_requise(moi.v, self.voitures[f].v, ecart_f, tau) > seuil_avant:
+                return False
+
+        r, d_centre_r = self.voiture_derriere(i, voie_cible, positions, voies)
+        if r is not None:
+            ecart_r = d_centre_r - lng
+            if ecart_r <= p.distance_min:
+                return False
+            if self._decel_requise(self.voitures[r].v, moi.v, ecart_r, tau) > seuil_arriere:
+                return False
+        return True
+
+    def _decider_voie(self, i, positions, voies) -> int:
+        """Choisit la voie de la voiture i au pas suivant (règles européennes).
+
+        1) On se rabat le plus à droite possible dès qu'il y a un créneau sûr
+           (avant ET arrière), avec une petite marge supplémentaire devant
+           (hystérésis anti-oscillation). Le rabattement reste « de confort ».
+        2) Sinon, on double UNIQUEMENT par la gauche si l'on est gêné (écart
+           avant < écart désiré) ET que le créneau de gauche est sûr.
+
+        La sûreté d'un créneau (`_creneau_libre`) est une décélération imposée
+        bornée, qui dépend des VITESSES et du TEMPS DE RÉACTION — pas seulement
+        d'une distance fixe. Le conducteur « fou » tolère des freinages
+        d'urgence (il coupe la route), le conducteur normal reste sur du confort.
         """
         p = self.p
         voiture = self.voitures[i]
         voie_actuelle = voies[i]
         lng = p.longueur_voiture
-        d_sec = voiture.distance_securite
+        d_des = voiture.distance_desiree()                # écart désiré à sa vitesse
+        confort = p.freinage_securite
+        # Le « fou » accepte d'imposer/subir un freinage d'urgence en déboîtant.
+        agressif = (-p.a_urgence) if voiture.profil.ignore_arriere_au_depassement \
+            else confort
 
-        # 1) Se rabattre à droite
-        distance_rabattement = 1.2 * d_sec
+        # 1) Se rabattre à droite (toujours en confort)
         if voie_actuelle > 1:
             for voie_droite in range(1, voie_actuelle):
                 _, d_dev = self.voiture_devant(i, voie_droite, positions, voies)
-                _, d_der = self.voiture_derriere(i, voie_droite, positions, voies)
-                if (d_dev - lng) > distance_rabattement and \
-                   (d_der - lng) > distance_rabattement:
+                if (d_dev - lng) > 1.2 * d_des and \
+                   self._creneau_libre(i, voie_droite, positions, voies, confort, confort):
                     return voie_droite
 
-        # 2) Doubler par la gauche
+        # 2) Doubler par la gauche (si gêné devant)
         voie_gauche = voie_actuelle + 1
         if voie_gauche <= self._voie_max(voiture):
             _, d_dev_actuel = self.voiture_devant(i, voie_actuelle, positions, voies)
-            if (d_dev_actuel - lng) < d_sec:               # trop proche devant
-                _, d_dev_g = self.voiture_devant(i, voie_gauche, positions, voies)
-                place_devant = (d_dev_g - lng) > d_sec
-                _, d_der_g = self.voiture_derriere(i, voie_gauche, positions, voies)
-                if voiture.profil.ignore_arriere_au_depassement:
-                    # Le « fou » ignore la distance de SÉCURITÉ arrière (il
-                    # coupe la route), mais garde l'interstice physique minimal :
-                    # il ne peut pas déboîter sur une voiture.
-                    place_derriere = d_der_g > p.distance_centre_min
-                else:
-                    place_derriere = (d_der_g - lng) > d_sec
-                if place_devant and place_derriere:
-                    return voie_gauche
+            if (d_dev_actuel - lng) < d_des and \
+               self._creneau_libre(i, voie_gauche, positions, voies, agressif, agressif):
+                return voie_gauche
 
         return voie_actuelle
 
@@ -376,10 +476,19 @@ class Simulation:
 
         # --- 1) Changements de voie (décidés sur l'état au temps t) ---
         # Mise à jour incrémentale : une voiture déjà déplacée est vue par les
-        # suivantes, ce qui limite les conflits de déboîtement simultané.
+        # suivantes, ce qui limite les conflits de déboîtement simultané. Un
+        # TEMPS MINIMAL entre deux changements (cooldown) empêche le papillonnage
+        # irréaliste (une voiture ne change pas de voie à chaque pas de temps).
+        n_cooldown = max(1, int(p.tps_min_changement_voie / p.dt))
         voies_t1 = np.array(voies, dtype=int)
         for i in range(N):
-            voies_t1[i] = self._decider_voie(i, positions, voies_t1)
+            if self._cooldown_voie[i] > 0:
+                self._cooldown_voie[i] -= 1
+                continue
+            nouvelle = self._decider_voie(i, positions, voies_t1)
+            if nouvelle != voies_t1[i]:
+                voies_t1[i] = nouvelle
+                self._cooldown_voie[i] = n_cooldown
         for i in range(N):
             self.voitures[i].voie = int(voies_t1[i])
 
@@ -421,7 +530,8 @@ class Simulation:
             jp, d_centre_p = self.voiture_devant(i, voies_perc[i], pos_perc, voies_perc)
             ecart = d_centre_p - p.longueur_voiture
             v_devant = vit_perc[jp] if jp is not None else voit.v
-            voit.a = voit.acceleration_souhaitee(ecart, v_devant, p.dt, p.a_min, p.a_max)
+            voit.a = voit.acceleration_souhaitee(ecart, v_devant, p.a_min, p.a_max,
+                                                 p.sensibilite_vitesse)
             v_new = voit.v + voit.a * p.dt
             vitesses_prov[i] = min(max(v_new, p.v_min), voit.vitesse_max)
             # Leader RÉEL (état courant) -> mémorisé pour le garde-fou anticollision
@@ -429,15 +539,39 @@ class Simulation:
             leaders[i] = jc
             d_centre_leaders[i] = d_centre_c
 
-        # --- 3) Garde-fou anticollision (sur l'état RÉEL : empêche tout
-        #        chevauchement même quand le conducteur a freiné trop tard) ---
+        # --- 3) Garde-fou anticollision + freinage borné physiquement ---
+        # Vitesse SÛRE = vitesse maximale depuis laquelle on peut encore s'arrêter
+        # dans l'espace disponible en freinant à |a_urgence| (cinématique) :
+        #     v_sure = v_leader + sqrt(2 * b * dispo)
+        # Tant que le conducteur reste sous v_sure, aucune intervention (il a la
+        # place de freiner progressivement). Sinon on freine au MAXIMUM PHYSIQUE
+        # (a_urgence) ; si même cela ne suffit pas, c'est une COLLISION (réaction
+        # trop tardive ou créneau coupé) : on la compte une fois par épisode et on
+        # borne la vitesse pour éviter le chevauchement réel (la simu continue).
+        b = -p.a_urgence
         for i in range(N):
+            voit = self.voitures[i]
             j = leaders[i]
-            if j is not None:
-                distance_disponible = d_centre_leaders[i] - p.distance_centre_min
-                v_limite = vitesses_prov[j] + 0.5 * distance_disponible
-                if vitesses_prov[i] > v_limite:
-                    vitesses_prov[i] = v_limite
+            if j is None:
+                self._en_collision[i] = False
+                if vitesses_prov[i] < 0:
+                    vitesses_prov[i] = 0.0
+                continue
+            dispo = d_centre_leaders[i] - p.distance_centre_min
+            v_sure = vitesses_prov[j] + (math.sqrt(2.0 * b * dispo) if dispo > 0 else 0.0)
+            if vitesses_prov[i] > v_sure:
+                v_plancher = voit.v + p.a_urgence * p.dt        # freinage physique max
+                vitesses_prov[i] = max(v_sure, v_plancher)
+                if v_sure < v_plancher:                         # choc inévitable
+                    if not self._en_collision[i]:
+                        self.nb_collisions += 1
+                        self._en_collision[i] = True
+                    v_sans_chevauchement = vitesses_prov[j] + dispo / p.dt
+                    vitesses_prov[i] = min(vitesses_prov[i], v_sans_chevauchement)
+                else:
+                    self._en_collision[i] = False
+            else:
+                self._en_collision[i] = False
             if vitesses_prov[i] < 0:
                 vitesses_prov[i] = 0.0
 
@@ -462,6 +596,9 @@ class Simulation:
         """
         p = self.p
         nb = p.nb_iterations
+        self.nb_collisions = 0
+        self._en_collision = [False] * p.N
+        self._cooldown_voie = np.zeros(p.N, dtype=int)
         X = np.empty((nb, p.N))
         V = np.empty((nb, p.N))
         A = np.empty((nb, p.N))
@@ -496,5 +633,6 @@ if __name__ == "__main__":
 
     print("\nFormes des historiques :", sim.X.shape, sim.VOIE.shape)
     print("Vitesse moyenne finale :", round(float(sim.V[-1].mean()), 2), "m/s")
+    print("Collisions détectées   :", sim.nb_collisions)
     print("Profils tirés          :", dict(collections.Counter(sim.profils_voitures)))
     print("Répartition par voie   :", dict(collections.Counter(sim.VOIE[-1].tolist())))
